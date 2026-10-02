@@ -1,0 +1,6 @@
+prog: runtime_nodebug
+args: nodebug
+vgopts: --basic-counts=no --trace-mem=yes --instr-atstart=no --trace-function=lackey_test_alpha --trace-output=runtime-nodebug.trace --log-file=runtime-nodebug.diagnostics
+prereq: rm -f runtime-nodebug.trace runtime-nodebug.addresses runtime-nodebug.diagnostics
+post: ./check_runtime_trace runtime-nodebug.addresses
+cleanup: rm -f runtime-nodebug.trace runtime-nodebug.addresses runtime-nodebug.diagnostics

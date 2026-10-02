@@ -1,0 +1,6 @@
+prog: runtime_control
+args: file
+vgopts: --basic-counts=no --trace-mem=yes --instr-atstart=no --trace-function=lackey_test_* --trace-output=runtime-file.trace --log-file=runtime-file.diagnostics
+prereq: rm -f runtime-file.trace runtime-file.addresses runtime-file.diagnostics
+post: ./check_runtime_trace runtime-file.addresses
+cleanup: rm -f runtime-file.trace runtime-file.addresses runtime-file.diagnostics

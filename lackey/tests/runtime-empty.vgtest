@@ -1,0 +1,6 @@
+prog: runtime_control
+args: empty
+vgopts: --basic-counts=yes --trace-mem=yes --instr-atstart=no --trace-function=does_not_match --trace-output=runtime-empty.trace --log-file=runtime-empty.diagnostics
+prereq: rm -f runtime-empty.trace runtime-empty.addresses runtime-empty.diagnostics
+post: ./check_runtime_trace runtime-empty.addresses
+cleanup: rm -f runtime-empty.trace runtime-empty.addresses runtime-empty.diagnostics

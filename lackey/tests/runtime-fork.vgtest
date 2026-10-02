@@ -1,0 +1,6 @@
+prog: runtime_control
+args: fork
+vgopts: --basic-counts=no --trace-mem=yes --instr-atstart=no --trace-function=lackey_test_alpha --trace-output=runtime-fork.trace --log-file=runtime-fork.diagnostics
+prereq: rm -f runtime-fork.trace runtime-fork.addresses runtime-fork.diagnostics runtime-fork-child.trace
+post: ./check_runtime_trace runtime-fork.addresses
+cleanup: rm -f runtime-fork.trace runtime-fork.addresses runtime-fork.diagnostics runtime-fork-child.trace

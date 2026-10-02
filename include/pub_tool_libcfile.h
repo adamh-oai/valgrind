@@ -74,6 +74,9 @@ extern SysRes VG_(open)   ( const HChar* pathname, Int flags, Int mode );
 /* fd_open words like the open(2) system call: 
    returns fd if success, -1 otherwise */
 extern Int VG_(fd_open)  (const HChar* pathname, Int flags, Int mode);
+/* Move a tool-owned descriptor out of the client's descriptor range and
+   set close-on-exec. Closes oldfd; exits on descriptor exhaustion. */
+extern Int VG_(safe_fd) (Int oldfd);
 extern void   VG_(close)  ( Int fd );
 extern Int    VG_(read)   ( Int fd, void* buf, Int count);
 extern Int    VG_(write)  ( Int fd, const void* buf, Int count);

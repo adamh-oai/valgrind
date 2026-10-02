@@ -1,0 +1,6 @@
+prog: runtime_control
+args: inline
+vgopts: --basic-counts=no --trace-mem=yes --instr-atstart=no --read-inline-info=yes --trace-function=lackey_inline_target --trace-file=runtime_inline.h --trace-output=runtime-inline.trace --log-file=runtime-inline.diagnostics
+prereq: rm -f runtime-inline.trace runtime-inline.addresses runtime-inline.diagnostics
+post: ./check_runtime_trace runtime-inline.addresses
+cleanup: rm -f runtime-inline.trace runtime-inline.addresses runtime-inline.diagnostics

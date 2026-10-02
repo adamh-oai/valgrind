@@ -1,0 +1,6 @@
+prog: runtime_control
+args: tail
+vgopts: --basic-counts=no --trace-mem=yes --instr-atstart=no --trace-function=lackey_test_tail --trace-output=runtime-tail.trace --log-file=runtime-tail.diagnostics
+prereq: rm -f runtime-tail.trace runtime-tail.addresses runtime-tail.diagnostics
+post: ./check_runtime_trace runtime-tail.addresses
+cleanup: rm -f runtime-tail.trace runtime-tail.addresses runtime-tail.diagnostics

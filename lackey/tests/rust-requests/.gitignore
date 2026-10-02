@@ -1,0 +1,4 @@
+/target/
+/rust-requests.trace
+/rust-requests-second.trace
+/rust-requests.addresses

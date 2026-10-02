@@ -1,0 +1,6 @@
+prog: runtime_control
+args: never
+vgopts: --basic-counts=yes --trace-mem=yes --instr-atstart=no --trace-function=lackey_test_alpha --trace-output=runtime-never.trace --log-file=runtime-never.diagnostics
+prereq: rm -f runtime-never.trace runtime-never.addresses runtime-never.diagnostics
+post: ./check_runtime_trace runtime-never.addresses
+cleanup: rm -f runtime-never.trace runtime-never.addresses runtime-never.diagnostics

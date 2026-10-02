@@ -175,6 +175,15 @@
 #include "pub_tool_libcbase.h"
 #include "pub_tool_options.h"
 #include "pub_tool_machine.h"     // VG_(fnptr_to_fnentry)
+#include "pub_tool_libcfile.h"
+#include "pub_tool_libcproc.h"
+#include "pub_tool_mallocfree.h"
+#include "pub_tool_gdbserver.h"
+#include "pub_tool_transtab.h"
+#include "pub_tool_vki.h"
+#include "pub_tool_vkiscnums.h"
+#include "pub_tool_seqmatch.h"
+#include "../callgrind/callgrind.h"
 
 /*------------------------------------------------------------*/
 /*--- Command line options                                 ---*/
@@ -186,6 +195,288 @@ static Bool clo_basic_counts    = True;
 static Bool clo_detailed_counts = False;
 static Bool clo_trace_mem       = False;
 static Bool clo_trace_sbs       = False;
+static Bool instrumentation_enabled = True;
+
+typedef struct _Pattern {
+   HChar* text;
+   struct _Pattern* next;
+} Pattern;
+
+static Pattern* function_patterns = NULL;
+static Pattern* file_patterns = NULL;
+static const HChar* clo_trace_output = NULL;
+
+/* Keep tracing separate from Valgrind's diagnostics. A private descriptor
+   prevents client close/dup operations from corrupting the trace sink. */
+#define TRACE_BUFFER_SIZE 65536
+static Int trace_fd = -1; /* -1 means the ordinary Valgrind log. */
+static HChar* trace_path = NULL;
+static HChar trace_buffer[TRACE_BUFFER_SIZE];
+static SizeT trace_used = 0;
+
+static void flush_trace(void)
+{
+   SizeT done = 0;
+   while (done < trace_used) {
+      Int written = VG_(write)(trace_fd, trace_buffer + done,
+                               trace_used - done);
+      if (written == -VKI_EINTR)
+         continue;
+      if (written <= 0) {
+         VG_(umsg)("Lackey: cannot write trace output %s (error %d)\n",
+                    trace_path, written < 0 ? -written : 0);
+         VG_(exit)(1);
+      }
+      done += written;
+   }
+   trace_used = 0;
+}
+
+static void trace_printf(const HChar* format, ...) PRINTF_CHECK(1, 2);
+
+static void trace_printf(const HChar* format, ...)
+{
+   va_list args;
+   va_start(args, format);
+   if (trace_fd < 0) {
+      /* Preserve stock Lackey output when no dedicated sink is selected. */
+      VG_(vprintf)(format, args);
+   } else {
+      HChar line[128];
+      UInt size = VG_(vsnprintf)(line, sizeof(line), format, args);
+      tl_assert(size < sizeof(line));
+      if (trace_used + size > TRACE_BUFFER_SIZE)
+         flush_trace();
+      VG_(memcpy)(trace_buffer + trace_used, line, size);
+      trace_used += size;
+   }
+   va_end(args);
+}
+
+/* Open first: a failed switch must not close or lose the previous sink.
+   Append also makes nested A -> B -> A output contexts preserve both A parts. */
+static Bool switch_trace_output(const HChar* path)
+{
+   Int new_fd = -1;
+   HChar* new_path = NULL;
+   if (VG_(strcmp)(path, "log") != 0) {
+      SysRes result = VG_(open)(path, VKI_O_WRONLY | VKI_O_CREAT | VKI_O_APPEND,
+                               VKI_S_IRUSR | VKI_S_IWUSR);
+      if (sr_isError(result)) {
+         VG_(umsg)("Lackey: cannot open trace output %s (error %lu); "
+                    "keeping previous output\n", path, (UWord)sr_Err(result));
+         return False;
+      }
+      new_fd = VG_(safe_fd)(sr_Res(result));
+      new_path = VG_(strdup)("lk.trace_path", path);
+   }
+   flush_trace();
+   if (trace_fd >= 0)
+      VG_(close)(trace_fd);
+   VG_(free)(trace_path);
+   trace_fd = new_fd;
+   trace_path = new_path;
+   return True;
+}
+
+static void trace_before_fork(ThreadId tid)
+{
+   /* Neither process should inherit a second copy of unwritten records. */
+   flush_trace();
+}
+
+static void trace_pre_syscall(ThreadId tid, UInt syscallno,
+                              UWord* args, UInt nArgs)
+{
+   /* A successful exec replaces tool state without calling lk_fini. Flush
+      before the attempt; a failed exec can continue using the same sink. */
+   Bool may_exec = False;
+#ifdef __NR_execve
+   may_exec = may_exec || syscallno == __NR_execve;
+#endif
+#ifdef __NR_execveat
+   may_exec = may_exec || syscallno == __NR_execveat;
+#endif
+#ifdef __NR_fexecve
+   may_exec = may_exec || syscallno == __NR_fexecve;
+#endif
+#ifdef __NR_posix_spawn
+   may_exec = may_exec || syscallno == __NR_posix_spawn;
+#endif
+   if (may_exec)
+      flush_trace();
+}
+
+static void trace_post_syscall(ThreadId tid, UInt syscallno,
+                               UWord* args, UInt nArgs, SysRes res)
+{
+   /* The syscall-wrapper interface requires both callbacks. */
+}
+
+static void add_pattern(Pattern** patterns, const HChar* text)
+{
+   Pattern* pattern = VG_(malloc)("lk.pattern", sizeof(*pattern));
+   pattern->text = VG_(strdup)("lk.pattern.text", text);
+   pattern->next = *patterns;
+   *patterns = pattern;
+}
+
+static void clear_patterns(Pattern** patterns)
+{
+   while (*patterns) {
+      Pattern* old = *patterns;
+      *patterns = old->next;
+      VG_(free)(old->text);
+      VG_(free)(old);
+   }
+}
+
+static Bool matches_patterns(const Pattern* patterns, const HChar* text)
+{
+   for (; patterns; patterns = patterns->next)
+      if (VG_(string_match)(patterns->text, text))
+         return True;
+   return False;
+}
+
+/* Called only from the tool's client-request callback: Valgrind's wrapper
+   permits safe invalidation there, unlike a dynamic CLO_CHANGE callback. */
+static void discard_instrumentation(void)
+{
+   VG_(discard_translations_safely)((Addr)0x1000, ~(SizeT)0xfff, "lackey");
+}
+
+static void set_instrumentation(Bool enabled)
+{
+   if (!enabled)
+      flush_trace();
+   if (instrumentation_enabled != enabled) {
+      instrumentation_enabled = enabled;
+      discard_instrumentation();
+   }
+}
+
+static Bool instruction_selected(DiEpoch ep, Addr address)
+{
+   const HChar* name;
+   if (function_patterns) {
+      Bool found = False;
+      InlIPCursor* cursor = VG_(new_IIPC)(ep, address);
+      do {
+         if (VG_(get_fnname_inl)(ep, address, &name, cursor)
+             && matches_patterns(function_patterns, name)) {
+            found = True;
+            break;
+         }
+      } while (VG_(next_IIPC)(cursor));
+      VG_(delete_IIPC)(cursor);
+      if (!found)
+         return False;
+   }
+   if (file_patterns) {
+      const HChar* directory;
+      UInt line;
+      Bool found;
+      if (!VG_(get_filename_linenum)(ep, address, &name, &directory, &line))
+         return False;
+      found = matches_patterns(file_patterns, name);
+      if (!found && directory && directory[0] && name[0] != '/') {
+         SizeT size = VG_(strlen)(directory) + VG_(strlen)(name) + 2;
+         HChar* path = VG_(malloc)("lk.source_path", size);
+         VG_(snprintf)(path, size, "%s/%s", directory, name);
+         found = matches_patterns(file_patterns, path);
+         VG_(free)(path);
+      }
+      /* DWARF producers may put an absolute path in the filename field. */
+      if (!found)
+         found = matches_patterns(file_patterns, VG_(basename)(name));
+      if (!found)
+         return False;
+   }
+   return True;
+}
+
+static void print_control_help(void)
+{
+   VG_(gdb_printf)(
+      "lackey instrumentation on|off\n"
+      "lackey function add <glob> | lackey function clear\n"
+      "lackey file add <glob> | lackey file clear\n"
+      "lackey filters clear\n"
+      "lackey output <path> | lackey output log\n"
+      "lackey status\n");
+}
+
+static Bool handle_monitor_command(const HChar* command)
+{
+   const HChar* rest;
+   Pattern* pattern;
+   if (VG_(strcmp)(command, "help") == 0) {
+      print_control_help();
+      return True;
+   }
+   if (VG_(strncmp)(command, "lackey ", 7) != 0)
+      return False;
+   rest = command + 7;
+   if (VG_(strcmp)(rest, "instrumentation on") == 0) {
+      set_instrumentation(True);
+   } else if (VG_(strcmp)(rest, "instrumentation off") == 0) {
+      set_instrumentation(False);
+   } else if (VG_(strncmp)(rest, "function add ", 13) == 0 && rest[13]) {
+      add_pattern(&function_patterns, rest + 13);
+      discard_instrumentation();
+   } else if (VG_(strcmp)(rest, "function clear") == 0) {
+      clear_patterns(&function_patterns);
+      discard_instrumentation();
+   } else if (VG_(strncmp)(rest, "file add ", 9) == 0 && rest[9]) {
+      add_pattern(&file_patterns, rest + 9);
+      discard_instrumentation();
+   } else if (VG_(strcmp)(rest, "file clear") == 0) {
+      clear_patterns(&file_patterns);
+      discard_instrumentation();
+   } else if (VG_(strcmp)(rest, "filters clear") == 0) {
+      clear_patterns(&function_patterns);
+      clear_patterns(&file_patterns);
+      discard_instrumentation();
+   } else if (VG_(strncmp)(rest, "output ", 7) == 0 && rest[7]) {
+      return switch_trace_output(rest + 7);
+   } else if (VG_(strcmp)(rest, "status") == 0) {
+      flush_trace();
+      VG_(gdb_printf)("instrumentation: %s\noutput: %s\n",
+                      instrumentation_enabled ? "on" : "off",
+                      trace_path ? trace_path : "log");
+      for (pattern = function_patterns; pattern; pattern = pattern->next)
+         VG_(gdb_printf)("function: %s\n", pattern->text);
+      for (pattern = file_patterns; pattern; pattern = pattern->next)
+         VG_(gdb_printf)("file: %s\n", pattern->text);
+   } else {
+      VG_(gdb_printf)("Lackey: invalid control command: %s\n", command);
+      print_control_help();
+      return False;
+   }
+   return True;
+}
+
+static Bool handle_client_request(ThreadId tid, UWord* args, UWord* ret)
+{
+   switch (args[0]) {
+      case VG_USERREQ__START_INSTRUMENTATION:
+         set_instrumentation(True);
+         *ret = 0;
+         return True;
+      case VG_USERREQ__STOP_INSTRUMENTATION:
+         set_instrumentation(False);
+         *ret = 0;
+         return True;
+      case VG_USERREQ__GDB_MONITOR_COMMAND: {
+         Bool handled = handle_monitor_command((const HChar*)args[1]);
+         *ret = handled ? 1 : 0;
+         return handled;
+      }
+      default:
+         return False;
+   }
+}
 
 /* The name of the function of which the number of calls (under
  * --basic-counts=yes) is to be counted, with default. Override with command
@@ -194,11 +485,24 @@ static const HChar* clo_fnname = "main";
 
 static Bool lk_process_cmd_line_option(const HChar* arg)
 {
+   const HChar* pattern;
    if VG_STR_CLO(arg, "--fnname", clo_fnname) {}
    else if VG_BOOL_CLO(arg, "--basic-counts",      clo_basic_counts) {}
    else if VG_BOOL_CLO(arg, "--detailed-counts",   clo_detailed_counts) {}
    else if VG_BOOL_CLO(arg, "--trace-mem",         clo_trace_mem) {}
    else if VG_BOOL_CLO(arg, "--trace-superblocks", clo_trace_sbs) {}
+   else if VG_BOOL_CLO(arg, "--instr-atstart", instrumentation_enabled) {}
+   else if VG_STR_CLO(arg, "--trace-output", clo_trace_output) {}
+   else if VG_STR_CLO(arg, "--trace-function", pattern) {
+      if (!pattern[0])
+         VG_(fmsg_bad_option)(arg, "function glob must not be empty\n");
+      add_pattern(&function_patterns, pattern);
+   }
+   else if VG_STR_CLO(arg, "--trace-file", pattern) {
+      if (!pattern[0])
+         VG_(fmsg_bad_option)(arg, "file glob must not be empty\n");
+      add_pattern(&file_patterns, pattern);
+   }
    else
       return False;
    
@@ -214,6 +518,10 @@ static void lk_print_usage(void)
 "    --detailed-counts=no|yes  count loads, stores and alu ops [no]\n"
 "    --trace-mem=no|yes        trace all loads and stores [no]\n"
 "    --trace-superblocks=no|yes  trace all superblock entries [no]\n"
+"    --instr-atstart=no|yes  enable Lackey instrumentation at startup [yes]\n"
+"    --trace-function=<glob> include matching functions (repeatable)\n"
+"    --trace-file=<glob>     include matching source files (repeatable)\n"
+"    --trace-output=<path>   append traces to a file [Valgrind log]\n"
 "    --fnname=<name>           count calls to <name> (only used if\n"
 "                              --basic-count=yes)  [main]\n"
    );
@@ -454,22 +762,22 @@ static Int   events_used = 0;
 
 static VG_REGPARM(2) void trace_instr(Addr addr, SizeT size)
 {
-   VG_(printf)("I  %08lx,%lu\n", addr, size);
+   trace_printf("I  %08lx,%lu\n", addr, size);
 }
 
 static VG_REGPARM(2) void trace_load(Addr addr, SizeT size)
 {
-   VG_(printf)(" L %08lx,%lu\n", addr, size);
+   trace_printf(" L %08lx,%lu\n", addr, size);
 }
 
 static VG_REGPARM(2) void trace_store(Addr addr, SizeT size)
 {
-   VG_(printf)(" S %08lx,%lu\n", addr, size);
+   trace_printf(" S %08lx,%lu\n", addr, size);
 }
 
 static VG_REGPARM(2) void trace_modify(Addr addr, SizeT size)
 {
-   VG_(printf)(" M %08lx,%lu\n", addr, size);
+   trace_printf(" M %08lx,%lu\n", addr, size);
 }
 
 
@@ -628,7 +936,7 @@ void addEvent_Dw ( IRSB* sb, IRAtom* daddr, Int dsize )
 
 static void trace_superblock(Addr addr)
 {
-   VG_(printf)("SB %08lx\n", addr);
+   trace_printf("SB %08lx\n", addr);
 }
 
 
@@ -639,6 +947,10 @@ static void trace_superblock(Addr addr)
 static void lk_post_clo_init(void)
 {
    Int op, tyIx;
+
+   if (clo_trace_output && !switch_trace_output(clo_trace_output))
+      VG_(exit)(1);
+   VG_(atfork)(trace_before_fork, NULL, NULL);
 
    if (clo_detailed_counts) {
       for (op = 0; op < N_OPS; op++)
@@ -663,6 +975,12 @@ IRSB* lk_instrument ( VgCallbackClosure* closure,
    UInt       ilen = 0;
    Bool       condition_inverted = False;
    DiEpoch    ep = VG_(current_DiEpoch)();
+   Bool       filtered = function_patterns != NULL || file_patterns != NULL;
+   Bool       selected = !filtered;
+   Bool       selected_in_block = False;
+
+   if (!instrumentation_enabled)
+      return sbIn;
 
    if (gWordTy != hWordTy) {
       /* We don't currently support this case. */
@@ -679,7 +997,7 @@ IRSB* lk_instrument ( VgCallbackClosure* closure,
       i++;
    }
 
-   if (clo_basic_counts) {
+   if (clo_basic_counts && !filtered) {
       /* Count this superblock. */
       di = unsafeIRDirty_0_N( 0, "add_one_SB_entered", 
                                  VG_(fnptr_to_fnentry)( &add_one_SB_entered ),
@@ -687,7 +1005,7 @@ IRSB* lk_instrument ( VgCallbackClosure* closure,
       addStmtToIRSB( sbOut, IRStmt_Dirty(di) );
    }
 
-   if (clo_trace_sbs) {
+   if (clo_trace_sbs && !filtered) {
       /* Print this superblock's address. */
       di = unsafeIRDirty_0_N( 
               0, "trace_superblock", 
@@ -704,6 +1022,36 @@ IRSB* lk_instrument ( VgCallbackClosure* closure,
    for (/*use current i*/; i < sbIn->stmts_used; i++) {
       IRStmt* st = sbIn->stmts[i];
       if (!st || st->tag == Ist_NoOp) continue;
+
+      if (st->tag == Ist_IMark) {
+         selected = !filtered || instruction_selected(
+            ep, st->Ist.IMark.addr + st->Ist.IMark.delta);
+         if (!selected && clo_trace_mem)
+            flushEvents(sbOut);
+         if (selected && !selected_in_block) {
+            selected_in_block = True;
+            /* Defer block helpers until an included instruction is reached:
+               earlier conditional exits may bypass the included portion. */
+            if (filtered && clo_basic_counts) {
+               di = unsafeIRDirty_0_N(
+                  0, "add_one_SB_entered",
+                  VG_(fnptr_to_fnentry)(&add_one_SB_entered), mkIRExprVec_0());
+               addStmtToIRSB(sbOut, IRStmt_Dirty(di));
+            }
+            if (filtered && clo_trace_sbs) {
+               di = unsafeIRDirty_0_N(
+                  0, "trace_superblock",
+                  VG_(fnptr_to_fnentry)(&trace_superblock),
+                  mkIRExprVec_1(mkIRExpr_HWord(st->Ist.IMark.addr)));
+               addStmtToIRSB(sbOut, IRStmt_Dirty(di));
+            }
+         }
+      }
+      if (!selected) {
+         /* Keep the guest statement, without adding any Lackey helpers. */
+         addStmtToIRSB(sbOut, st);
+         continue;
+      }
 
       if (clo_basic_counts) {
          /* Count one VEX statement. */
@@ -978,7 +1326,7 @@ IRSB* lk_instrument ( VgCallbackClosure* closure,
       }
    }
 
-   if (clo_basic_counts) {
+   if (clo_basic_counts && selected) {
       /* Count this basic block. */
       di = unsafeIRDirty_0_N( 0, "add_one_SB_completed", 
                                  VG_(fnptr_to_fnentry)( &add_one_SB_completed ),
@@ -996,6 +1344,15 @@ IRSB* lk_instrument ( VgCallbackClosure* closure,
 
 static void lk_fini(Int exitcode)
 {
+   flush_trace();
+   if (trace_fd >= 0) {
+      VG_(close)(trace_fd);
+      trace_fd = -1;
+   }
+   VG_(free)(trace_path);
+   trace_path = NULL;
+   clear_patterns(&function_patterns);
+   clear_patterns(&file_patterns);
    tl_assert(clo_fnname);
    tl_assert(clo_fnname[0]);
 
@@ -1021,14 +1378,12 @@ static void lk_fini(Int exitcode)
       
       VG_(umsg)("\n");
       VG_(umsg)("Ratios:\n");
-      tl_assert(n_SBs_entered); // Paranoia time.
       VG_(umsg)("  guest instrs : SB entered  = %'llu : 10\n",
-         10 * n_guest_instrs / n_SBs_entered);
+         n_SBs_entered ? 10 * n_guest_instrs / n_SBs_entered : 0);
       VG_(umsg)("       IRStmts : SB entered  = %'llu : 10\n",
-         10 * n_IRStmts / n_SBs_entered);
-      tl_assert(n_guest_instrs); // Paranoia time.
+         n_SBs_entered ? 10 * n_IRStmts / n_SBs_entered : 0);
       VG_(umsg)("       IRStmts : guest instr = %'llu : 10\n",
-         10 * n_IRStmts / n_guest_instrs);
+         n_guest_instrs ? 10 * n_IRStmts / n_guest_instrs : 0);
    }
 
    if (clo_detailed_counts) {
@@ -1059,6 +1414,8 @@ static void lk_pre_clo_init(void)
    VG_(needs_command_line_options)(lk_process_cmd_line_option,
                                    lk_print_usage,
                                    lk_print_debug_usage);
+   VG_(needs_client_requests)(handle_client_request);
+   VG_(needs_syscall_wrapper)(trace_pre_syscall, trace_post_syscall);
 }
 
 VG_DETERMINE_INTERFACE_VERSION(lk_pre_clo_init)

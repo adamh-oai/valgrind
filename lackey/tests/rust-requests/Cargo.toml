@@ -1,0 +1,12 @@
+[package]
+name = "lackey-requests-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+valgrind-requests = "1.1.0"
+
+[profile.dev]
+debug = 2
+opt-level = 0

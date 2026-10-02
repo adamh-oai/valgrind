@@ -1,0 +1,39 @@
+#!/usr/bin/env perl
+# Compare only deliberate volatile stores, keeping the oracle independent of
+# ASLR, compiler-generated stack accesses, instruction counts, and word size.
+use strict;
+use warnings;
+# Client addresses naturally exceed 32 bits on the 64-bit test platforms.
+no warnings 'portable';
+
+@ARGV == 1 or die "usage: check_runtime_trace ADDRESS_MANIFEST\n";
+open my $manifest, '<', $ARGV[0] or die "open $ARGV[0]: $!\n";
+my %expected;
+my $checks = 0;
+while (<$manifest>) {
+    chomp;
+    my ($file, $phase, $address, $count) = split /\t/;
+    defined($count) or die "invalid manifest row: $_\n";
+    $expected{$file}{hex($address)} = [$phase, $count];
+    $checks++;
+}
+$checks > 0 or die "empty address manifest\n";
+close $manifest;
+
+for my $file (sort keys %expected) {
+    open my $trace, '<', $file or die "open $file: $!\n";
+    my %actual;
+    while (<$trace>) {
+        if (/^\s*[SM]\s+([[:xdigit:]]+),\d+/) {
+            $actual{hex($1)}++;
+        }
+    }
+    close $trace;
+    for my $address (sort { $a <=> $b } keys %{$expected{$file}}) {
+        my ($phase, $wanted) = @{$expected{$file}{$address}};
+        my $seen = $actual{$address} // 0;
+        $seen == $wanted
+            or die "$file phase $phase: expected $wanted stores, observed $seen\n";
+    }
+}
+print "all watched stores matched\n";

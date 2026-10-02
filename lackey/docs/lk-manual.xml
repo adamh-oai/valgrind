@@ -131,8 +131,140 @@ performance.</para>
     </listitem>
   </varlistentry>
 
+  <varlistentry id="opt.lk-instr-atstart" xreflabel="--instr-atstart">
+    <term><option><![CDATA[--instr-atstart=<no|yes> [default: yes] ]]></option></term>
+    <listitem><para>Controls whether Lackey instruments code at startup.
+    When disabled, Lackey adds no counting or tracing helpers. Instrumentation
+    can be enabled later with the client requests described below.</para></listitem>
+  </varlistentry>
+
+  <varlistentry id="opt.lk-trace-function" xreflabel="--trace-function">
+    <term><option><![CDATA[--trace-function=<glob> ]]></option></term>
+    <listitem><para>Include instructions whose function name matches the
+    pattern. This option can be repeated. Patterns use Valgrind's
+    <literal>*</literal> and <literal>?</literal> wildcards and match demangled
+    function names. With <option>--read-inline-info=yes</option>, matching any
+    function in the instruction's inline call chain includes that instruction.
+    Without this option, only the containing non-inlined function is
+    available. Instructions with no matching function information are excluded
+    when a function filter is present.</para></listitem>
+  </varlistentry>
+
+  <varlistentry id="opt.lk-trace-file" xreflabel="--trace-file">
+    <term><option><![CDATA[--trace-file=<glob> ]]></option></term>
+    <listitem><para>Include instructions whose source filename matches the
+    pattern. Patterns are checked against the filename, its basename, and
+    the directory plus filename recorded in debug information. This option
+    can be repeated. Files are source files, not executable or shared-library
+    names. Compile with debug information to provide source locations;
+    instructions without a source location are excluded when a file filter
+    is present.</para></listitem>
+  </varlistentry>
+
+  <varlistentry id="opt.lk-trace-output" xreflabel="--trace-output">
+    <term><option><![CDATA[--trace-output=<path> [default: log] ]]></option></term>
+    <listitem><para>Append instruction, memory, and superblock trace records
+    to a dedicated file. The special value <literal>log</literal> selects the
+    ordinary Valgrind log; use <literal>./log</literal> for a file with that
+    name. File paths are used literally, without percent substitutions.
+    Counters, diagnostics, and monitor replies remain on the Valgrind log.
+    Dedicated trace output is buffered and flushed when switching output,
+    disabling instrumentation, printing status, before fork or exec, and at exit.
+    Buffered data can be lost on abrupt termination such as SIGKILL.</para></listitem>
+  </varlistentry>
+
 </variablelist>
 <!-- end of xi:include in the manpage -->
+
+</sect1>
+
+<sect1 id="lk-manual.runtime" xreflabel="Runtime control">
+<title>Runtime control and instruction selection</title>
+
+<para>With no filters and instrumentation enabled, Lackey retains its
+usual behavior. Multiple function patterns are alternatives, as are multiple
+file patterns. If both categories are present, an instruction must satisfy
+both. Clearing a category removes its restriction. Selection is evaluated
+at each guest instruction during translation, including instructions reached
+by Valgrind's superblock chaining. Excluded instructions receive no Lackey
+helpers. Selecting a function does not automatically include functions it
+calls. A file match uses the instruction's line-table source location, not
+every file in its inline call chain. JIT code without registered function or
+source information cannot match the corresponding filters.</para>
+
+<para>All Lackey modes use the selection. With filters, a superblock is
+counted and its trace entry emitted when its first included instruction is
+reached. The <literal>SB</literal> record gives that instruction's address.
+A completed superblock is counted only when its last instruction is included.
+Instruction and IR counts cover included instructions. Empty selections and
+runs that never enable instrumentation are valid and produce zero counts.</para>
+
+<para>The following monitor commands can be issued from GDB, via
+<computeroutput>vgdb</computeroutput>, or from the client program with
+<function>VALGRIND_MONITOR_COMMAND</function>:</para>
+
+<programlisting><![CDATA[
+lackey instrumentation on
+lackey instrumentation off
+lackey function add <glob>
+lackey function clear
+lackey file add <glob>
+lackey file clear
+lackey filters clear
+lackey output <path>
+lackey output log
+lackey status
+]]></programlisting>
+
+<para>A pattern or path occupies the remainder of the command, including
+spaces; do not add shell-style quotes inside the command string. Instrumentation
+changes and filter changes discard cached translations, so previously executed
+code follows the new selection on its next execution. The settings are global
+to the process and apply to all threads. A multi-command configuration update
+is not atomic: disable instrumentation first when changing several settings.
+These commands do not reset accumulated counters.</para>
+
+<para>Lackey also accepts <function>CALLGRIND_START_INSTRUMENTATION</function>
+and <function>CALLGRIND_STOP_INSTRUMENTATION</function> from
+<filename>callgrind/callgrind.h</filename> as aliases. Other Callgrind requests,
+including toggling collection and dumping statistics, are not implemented by
+Lackey. <function>VALGRIND_CLO_CHANGE</function> does not replace these monitor
+commands: the ordinary option callback does not permit the translation
+invalidation required for safe switching.</para>
+
+<para>For example, existing Rust bindings can control this fork without a
+new request definition:</para>
+
+<programlisting><![CDATA[
+use valgrind_requests::{callgrind, valgrind}; // version 1.1.0
+
+assert!(valgrind::running_on_valgrind() != 0);
+assert!(valgrind::monitor_command(c"lackey function add target_*"));
+assert!(valgrind::monitor_command(c"lackey output region.trace"));
+callgrind::start_instrumentation();
+// Execute the workload here.
+callgrind::stop_instrumentation();
+assert!(valgrind::monitor_command(c"lackey output log"));
+]]></programlisting>
+
+<para>Rust's <function>monitor_command</function> returns true when a command
+succeeds; the C <function>VALGRIND_MONITOR_COMMAND</function> returns zero.
+Check these results to detect an unsupported Valgrind build or a failed output
+switch. An invalid command leaves settings unchanged. A failed file open keeps
+the previous output sink and returns failure. An unrecoverable write failure
+terminates the process with an error, rather than silently dropping trace
+records. Valgrind's protected-descriptor allocation is also fatal if its
+descriptor reserve is exhausted.</para>
+
+<para>Output switches open the next file before closing the previous one.
+Files are always appended, so switching A to B and back to A preserves both
+A regions. This supports output contexts whose exit restores the previous
+path. A fork flushes pending records first; parent and child then append to
+the inherited file unless either switches output. Their subsequent records
+may interleave and contain no process or thread identifiers. A context that
+changes global instrumentation or output must coordinate with other threads.
+Pending records are also flushed before exec, which otherwise replaces the
+tool state without running its normal exit handler.</para>
 
 </sect1>
 
